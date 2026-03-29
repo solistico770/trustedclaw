@@ -23,7 +23,7 @@ export type ClassificationResult = {
 
 async function geminiJSON<T>(prompt: string): Promise<T> {
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash",
+    model: "gemini-2.5-flash",
     generationConfig: { responseMimeType: "application/json" },
   });
 

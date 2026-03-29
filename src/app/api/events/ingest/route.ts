@@ -48,12 +48,17 @@ export async function POST(req: NextRequest) {
       target_type: "event", target_id: event.id, reasoning: `Ingested from ${gType}`,
     });
 
-    // Trigger pipeline async (fire and forget in this context)
-    runPipeline(db, event.id, user_id).catch((e) =>
-      console.error("[ingest] pipeline error:", e)
-    );
+    // Run pipeline synchronously — Vercel serverless kills background tasks
+    try {
+      await runPipeline(db, event.id, user_id);
+    } catch (e) {
+      console.error("[ingest] pipeline error:", e);
+    }
 
-    return NextResponse.json({ event_id: event.id, processing_status: "pending" });
+    // Get final status
+    const { data: final } = await db.from("events").select("processing_status").eq("id", event.id).single();
+
+    return NextResponse.json({ event_id: event.id, processing_status: final?.processing_status || "pending" });
   } catch (e) {
     console.error("[ingest] error:", e);
     return NextResponse.json({ error: "Internal error" }, { status: 500 });

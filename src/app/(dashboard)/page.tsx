@@ -6,152 +6,163 @@ import { DEMO_USER_ID } from "@/lib/constants";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useRouter } from "next/navigation";
 
-type Escalation = {
+type CaseEntity = {
+  entity_id: string;
+  role: string;
+  entities: { id: string; canonical_name: string; type: string } | null;
+};
+
+type Case = {
   id: string;
-  event_id: string;
-  reasoning: string;
+  title: string | null;
+  summary: string | null;
+  status: string;
+  importance_level: number;
+  escalation_level: string;
+  current_severity: string;
+  current_urgency: string;
+  event_count: number;
+  last_event_at: string | null;
+  first_event_at: string | null;
+  next_action_date: string | null;
   created_at: string;
-  reminded: boolean;
-  events: {
-    id: string;
-    raw_payload: Record<string, string>;
-    normalized_payload: Record<string, string> | null;
-    enrichment_data: Record<string, unknown> | null;
-    occurred_at: string;
-    classifications: Array<{
-      severity: string;
-      urgency: string;
-      importance_score: number;
-      reasoning: string;
-    }>;
-    event_entities: Array<{
-      entities: { canonical_name: string; type: string };
-    }>;
-  };
+  case_entities: CaseEntity[];
 };
 
+const STATUS_COLORS: Record<string, string> = {
+  open: "bg-blue-600", action_needed: "bg-red-600", in_progress: "bg-yellow-600",
+  addressed: "bg-green-600", scheduled: "bg-purple-600", closed: "bg-zinc-600", escalated: "bg-red-700",
+};
+const ESCALATION_COLORS: Record<string, string> = {
+  none: "bg-zinc-700", low: "bg-blue-700", medium: "bg-yellow-700", high: "bg-orange-600", critical: "bg-red-700",
+};
 const SEVERITY_COLORS: Record<string, string> = {
-  critical: "bg-red-600",
-  high: "bg-orange-500",
-  medium: "bg-yellow-500",
-  low: "bg-blue-500",
-  info: "bg-zinc-500",
+  critical: "bg-red-600", high: "bg-orange-500", medium: "bg-yellow-500", low: "bg-blue-500", info: "bg-zinc-500",
 };
 
-const GATE_ICONS: Record<string, string> = {
-  simulator: "🧪",
-  whatsapp: "💬",
-  telegram: "✈️",
-  slack: "💼",
-  generic: "📨",
-};
+function ImportanceBar({ level }: { level: number }) {
+  return (
+    <div className="flex gap-0.5 items-center" title={`Importance: ${level}/10`}>
+      {Array.from({ length: 10 }, (_, i) => (
+        <div key={i} className={`w-2 h-3 rounded-sm ${i < level ? (level >= 8 ? "bg-red-500" : level >= 5 ? "bg-yellow-500" : "bg-blue-500") : "bg-zinc-800"}`} />
+      ))}
+      <span className="text-xs text-zinc-500 mr-1">{level}</span>
+    </div>
+  );
+}
 
-export default function InboxPage() {
-  const [escalations, setEscalations] = useState<Escalation[]>([]);
+export default function CasesBoard() {
+  const [cases, setCases] = useState<Case[]>([]);
   const [loading, setLoading] = useState(true);
+  const [statusFilter, setStatusFilter] = useState("");
+  const router = useRouter();
 
-  const fetchEscalations = useCallback(async () => {
-    const res = await fetch(`/api/escalations?user_id=${DEMO_USER_ID}`);
+  const fetchCases = useCallback(async () => {
+    const url = `/api/cases?user_id=${DEMO_USER_ID}${statusFilter ? `&status=${statusFilter}` : ""}&sort_by=importance`;
+    const res = await fetch(url);
     const data = await res.json();
-    if (Array.isArray(data)) setEscalations(data);
+    if (Array.isArray(data)) setCases(data);
     setLoading(false);
-  }, []);
+  }, [statusFilter]);
 
   useEffect(() => {
-    fetchEscalations();
+    fetchCases();
     const supabase = createBrowserClient();
     const channel = supabase
-      .channel("inbox-realtime")
-      .on("postgres_changes", {
-        event: "*",
-        schema: "public",
-        table: "triage_decisions",
-      }, () => fetchEscalations())
+      .channel("cases-board")
+      .on("postgres_changes", { event: "*", schema: "public", table: "cases" }, () => fetchCases())
       .subscribe();
-
     return () => { supabase.removeChannel(channel); };
-  }, [fetchEscalations]);
+  }, [fetchCases]);
 
-  async function handleResolve(id: string, decision: string, snoozeHours?: number) {
-    await fetch(`/api/escalations/${id}/resolve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        decision,
-        user_id: DEMO_USER_ID,
-        snooze_until: snoozeHours ? new Date(Date.now() + snoozeHours * 60 * 60 * 1000).toISOString() : undefined,
-      }),
-    });
-    setEscalations((prev) => prev.filter((e) => e.id !== id));
+  async function quickAction(caseId: string, action: string) {
+    if (action === "close") {
+      await fetch(`/api/cases/${caseId}/close`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: DEMO_USER_ID, reason: "Closed from board" }),
+      });
+    } else if (action === "addressed") {
+      await fetch(`/api/cases/${caseId}/status`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: DEMO_USER_ID, status: "addressed", reason: "Marked as addressed" }),
+      });
+    } else if (action === "schedule") {
+      const date = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      await fetch(`/api/cases/${caseId}/status`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: DEMO_USER_ID, status: "scheduled", next_action_date: date, reason: "Scheduled for tomorrow" }),
+      });
+    }
+    fetchCases();
   }
 
   if (loading) {
     return <div className="space-y-4">{[1,2,3].map(i => <div key={i} className="h-32 bg-zinc-900 rounded-lg animate-pulse" />)}</div>;
   }
 
-  if (escalations.length === 0) {
+  if (cases.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-20 text-zinc-500">
         <div className="text-4xl mb-4">✅</div>
         <p className="text-lg">הכל תחת שליטה</p>
-        <p className="text-sm">אין פריטים הדורשים תשומת לבך כרגע</p>
+        <p className="text-sm">אין cases פתוחים כרגע</p>
       </div>
     );
   }
 
   return (
     <div className="space-y-4">
-      <h2 className="text-xl font-bold">Escalation Inbox ({escalations.length})</h2>
-      {escalations.map((esc) => {
-        const cls = esc.events?.classifications?.[0];
-        const raw = esc.events?.raw_payload;
-        const np = esc.events?.normalized_payload;
-        const gateType = raw?.gate_type || "generic";
-        const severity = cls?.severity || "medium";
+      <div className="flex items-center gap-4">
+        <h2 className="text-xl font-bold">Cases ({cases.length})</h2>
+        <select className="bg-zinc-800 border border-zinc-700 rounded px-2 py-1 text-sm" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <option value="">All open</option>
+          <option value="action_needed,escalated">Action needed</option>
+          <option value="open">Open</option>
+          <option value="in_progress">In progress</option>
+          <option value="scheduled">Scheduled</option>
+          <option value="addressed">Addressed</option>
+          <option value="closed">Closed</option>
+        </select>
+      </div>
 
-        return (
-          <Card key={esc.id} className="bg-zinc-900 border-zinc-800">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-lg">{GATE_ICONS[gateType] || "📨"}</span>
-                <Badge className={`${SEVERITY_COLORS[severity]} text-white`}>{severity}</Badge>
-                <span className="text-sm text-zinc-400">{np?.sender_name || raw?.sender_name || "Unknown"}</span>
-                <span className="text-xs text-zinc-600 mr-auto">{new Date(esc.events?.occurred_at).toLocaleString("he-IL")}</span>
-                {esc.reminded && <Badge variant="outline" className="text-yellow-400 border-yellow-400">Reminded</Badge>}
-              </div>
-              <CardTitle className="text-base mt-1 leading-relaxed">
-                {np?.content_text || raw?.content || "No content"}
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {cls?.reasoning && (
-                <p className="text-xs text-zinc-400 mb-3">{cls.reasoning}</p>
+      {cases.map((c) => (
+        <Card key={c.id} className="bg-zinc-900 border-zinc-800 hover:border-zinc-600 transition cursor-pointer" onClick={() => router.push(`/cases/${c.id}`)}>
+          <CardHeader className="pb-2">
+            <div className="flex items-center gap-2 flex-wrap">
+              <Badge className={`${STATUS_COLORS[c.status]} text-white`}>{c.status}</Badge>
+              <Badge className={`${SEVERITY_COLORS[c.current_severity]} text-white text-xs`}>{c.current_severity}</Badge>
+              {c.escalation_level !== "none" && (
+                <Badge className={`${ESCALATION_COLORS[c.escalation_level]} text-white text-xs`}>esc: {c.escalation_level}</Badge>
               )}
-              {esc.events?.event_entities?.length > 0 && (
-                <div className="flex gap-1 mb-3 flex-wrap">
-                  {esc.events.event_entities.map((ee, i) => (
+              <span className="text-xs text-zinc-500">{c.event_count} events</span>
+              <span className="text-xs text-zinc-600 mr-auto">{c.last_event_at ? new Date(c.last_event_at).toLocaleString("he-IL") : ""}</span>
+            </div>
+            <CardTitle className="text-base mt-1">{c.title || `Case ${c.id.slice(0, 8)}`}</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {c.summary && <p className="text-xs text-zinc-400 mb-2">{c.summary}</p>}
+            <div className="flex items-center gap-3 mb-3">
+              <ImportanceBar level={c.importance_level} />
+              {c.case_entities?.length > 0 && (
+                <div className="flex gap-1 flex-wrap">
+                  {c.case_entities.map((ce, i) => (
                     <Badge key={i} variant="secondary" className="text-xs">
-                      {ee.entities?.canonical_name} ({ee.entities?.type})
+                      {ce.entities?.canonical_name} ({ce.entities?.type})
                     </Badge>
                   ))}
                 </div>
               )}
-              <div className="flex gap-2">
-                <Button size="sm" onClick={() => handleResolve(esc.id, "approve")} className="bg-green-700 hover:bg-green-600">
-                  Approve
-                </Button>
-                <Button size="sm" variant="outline" onClick={() => handleResolve(esc.id, "dismiss")}>
-                  Dismiss
-                </Button>
-                <Button size="sm" variant="ghost" onClick={() => handleResolve(esc.id, "snooze", 4)} className="text-zinc-400">
-                  Snooze 4h
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        );
-      })}
+            </div>
+            <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
+              <Button size="sm" variant="outline" onClick={() => quickAction(c.id, "addressed")}>Addressed</Button>
+              <Button size="sm" variant="ghost" className="text-zinc-400" onClick={() => quickAction(c.id, "schedule")}>Schedule</Button>
+              <Button size="sm" variant="ghost" className="text-red-400" onClick={() => quickAction(c.id, "close")}>Close</Button>
+            </div>
+          </CardContent>
+        </Card>
+      ))}
     </div>
   );
 }

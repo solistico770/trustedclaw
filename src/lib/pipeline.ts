@@ -1,18 +1,15 @@
 import { SupabaseClient } from "@supabase/supabase-js";
-import { enrichEvent, classifyEvent, EnrichmentResult } from "./gemini";
-import { evaluatePolicy, PolicyRule, EvaluationContext } from "./policy-engine";
+import { enrichEvent, EnrichmentResult } from "./gemini";
+import { classifyCase } from "./gemini-case";
+import { evaluatePolicy, PolicyRule } from "./policy-engine";
 import { logAudit } from "./audit";
-
-const SEVERITY_WEIGHT: Record<string, number> = {
-  critical: 100, high: 75, medium: 50, low: 25, info: 10,
-};
-const URGENCY_WEIGHT: Record<string, number> = {
-  immediate: 100, soon: 75, normal: 50, low: 25,
-};
-
-function computeImportance(severity: string, urgency: string): number {
-  return ((SEVERITY_WEIGHT[severity] || 50) * 0.6 + (URGENCY_WEIGHT[urgency] || 50) * 0.4);
-}
+import {
+  findOrCreateCase,
+  addEventToCase,
+  updateCaseEntities,
+  updateCaseClassification,
+  transitionCaseStatus,
+} from "./case-manager";
 
 export async function runPipeline(db: SupabaseClient, eventId: string, userId: string) {
   try {
@@ -25,8 +22,6 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
     if (fetchErr || !event) throw new Error(`Event not found: ${eventId}`);
 
     const status = event.processing_status;
-
-    // Already completed
     if (status === "completed" || status === "permanent_failure") return;
 
     // Mark processing
@@ -35,7 +30,7 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
       processing_started_at: new Date().toISOString(),
     }).eq("id", eventId);
 
-    // 2. Normalize (if needed)
+    // 2. Normalize
     if (["pending", "processing"].includes(status)) {
       try {
         const raw = event.raw_payload;
@@ -69,14 +64,16 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
       }
     }
 
-    // Re-fetch after normalize
+    // Re-fetch
     const { data: ev2 } = await db.from("events").select("*").eq("id", eventId).single();
     if (!ev2) return;
     const np = ev2.normalized_payload;
 
-    // 3. Enrich (Gemini)
+    // 3. Enrich (event-level — extract entities from this message)
     let enrichment: EnrichmentResult | null = null;
-    if (["normalized", "enrichment_failed"].includes(ev2.processing_status) || status === "pending") {
+    const currentStatus = ev2.processing_status;
+
+    if (["normalized", "enrichment_failed"].includes(currentStatus)) {
       try {
         enrichment = await enrichEvent(np.content_text, np.sender_name, np.channel_name);
 
@@ -91,16 +88,12 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
           reasoning: `Language: ${enrichment.detected_language}, Entities: ${enrichment.mentioned_entities.length}`,
         });
 
-        // Entity linking
+        // Entity linking (event-level)
         for (const me of enrichment.mentioned_entities) {
           if (me.confidence < 0.7) continue;
 
-          // Try to find existing entity
           const { data: existing } = await db.from("entities")
-            .select("id")
-            .eq("user_id", userId)
-            .ilike("canonical_name", me.name)
-            .limit(1);
+            .select("id").eq("user_id", userId).ilike("canonical_name", me.name).limit(1);
 
           let entityId: string;
           if (existing && existing.length > 0) {
@@ -108,20 +101,14 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
           } else {
             const entityType = ["person", "company", "project", "invoice"].includes(me.type) ? me.type : "other";
             const { data: newEntity } = await db.from("entities").insert({
-              user_id: userId,
-              type: entityType,
-              canonical_name: me.name,
-              auto_created: true,
+              user_id: userId, type: entityType, canonical_name: me.name, auto_created: true,
             }).select("id").single();
             if (!newEntity) continue;
             entityId = newEntity.id;
           }
 
           await db.from("event_entities").insert({
-            event_id: eventId,
-            entity_id: entityId,
-            role: "mentioned",
-            confidence_score: me.confidence,
+            event_id: eventId, entity_id: entityId, role: "mentioned", confidence_score: me.confidence,
           });
         }
       } catch (e) {
@@ -131,120 +118,171 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
           user_id: userId, actor: "agent", action_type: "enrich_failed",
           target_type: "event", target_id: eventId, reasoning: String(e),
         });
-        // Continue with reduced confidence
       }
     } else if (ev2.enrichment_data) {
       enrichment = ev2.enrichment_data;
     }
 
-    // 4. Classify (Gemini)
-    let severity = "medium";
-    let urgency = "normal";
-    let reasoning = "auto-classification failed — default applied";
-    let confidence = 0;
-    let proposedAction = "Review manually";
+    // 3.5. CASE ASSIGNMENT — find or create case, link event
+    const channelId = ev2.channel_id;
+    const threadId = ev2.thread_id;
 
-    const currentStatus = (await db.from("events").select("processing_status").eq("id", eventId).single()).data?.processing_status;
+    let caseId = ev2.case_id;
+    if (!caseId) {
+      caseId = await findOrCreateCase(db, userId, channelId, threadId, np);
+      await addEventToCase(db, caseId, eventId);
 
-    if (!currentStatus || ["enriched", "enrichment_failed", "normalized", "classification_failed"].includes(currentStatus)) {
+      // Propagate entity links to case level
+      const { data: eventEnts } = await db.from("event_entities")
+        .select("entity_id, role").eq("event_id", eventId);
+      if (eventEnts && eventEnts.length > 0) {
+        await updateCaseEntities(db, caseId, eventEnts);
+      }
+    }
+
+    // 4. CASE-LEVEL CLASSIFICATION (replaces event-level)
+    const updatedStatus = (await db.from("events").select("processing_status").eq("id", eventId).single()).data?.processing_status;
+
+    if (!updatedStatus || ["enriched", "enrichment_failed", "normalized", "classification_failed"].includes(updatedStatus)) {
       try {
-        const classification = await classifyEvent(np.content_text, enrichment || undefined, np.sender_name);
-        severity = classification.severity;
-        urgency = classification.urgency;
-        reasoning = classification.reasoning;
-        confidence = classification.confidence || 0.8;
-        proposedAction = classification.proposed_action;
+        // Gather ALL events in this case for holistic classification
+        const { data: caseEvents } = await db.from("events")
+          .select("normalized_payload, enrichment_data")
+          .eq("case_id", caseId)
+          .order("occurred_at", { ascending: true })
+          .limit(20);
 
-        const importanceScore = computeImportance(severity, urgency);
+        const eventContents = (caseEvents || [])
+          .map(e => e.normalized_payload?.content_text || "")
+          .filter(Boolean);
 
+        // Get entity names for context
+        const { data: caseEnts } = await db.from("case_entities")
+          .select("entities(canonical_name)")
+          .eq("case_id", caseId);
+        const entityNames = (caseEnts || [])
+          .map((ce: Record<string, unknown>) => {
+            const ent = ce.entities as Record<string, string> | null;
+            return ent?.canonical_name;
+          })
+          .filter(Boolean) as string[];
+
+        // Get current case state
+        const { data: currentCase } = await db.from("cases")
+          .select("title, status, importance_level").eq("id", caseId).single();
+
+        const caseClassification = await classifyCase(
+          currentCase?.title || null,
+          eventContents,
+          entityNames,
+          currentCase?.status,
+          currentCase?.importance_level
+        );
+
+        // Store classification (linked to both event and case)
+        const importanceScore = caseClassification.importance_level * 10;
         await db.from("classifications").insert({
           event_id: eventId,
+          case_id: caseId,
           user_id: userId,
-          severity,
-          urgency,
+          severity: caseClassification.severity,
+          urgency: caseClassification.urgency,
           importance_score: importanceScore,
-          reasoning,
-          confidence,
+          reasoning: caseClassification.reasoning,
+          confidence: 0.9,
           classified_by: "agent",
         });
+
+        // Update case with new classification
+        await updateCaseClassification(db, caseId, userId, {
+          severity: caseClassification.severity,
+          urgency: caseClassification.urgency,
+          importance_level: caseClassification.importance_level,
+          escalation_level: caseClassification.escalation_level,
+          title: caseClassification.title,
+          summary: caseClassification.summary,
+          reasoning: caseClassification.reasoning,
+        });
+
+        // Update case status if AI suggests change
+        if (caseClassification.suggested_status && caseClassification.suggested_status !== currentCase?.status) {
+          await transitionCaseStatus(db, caseId, userId, caseClassification.suggested_status, "agent",
+            `AI suggests: ${caseClassification.reasoning}`);
+        }
 
         await db.from("events").update({ processing_status: "classified" }).eq("id", eventId);
 
         await logAudit(db, {
-          user_id: userId, actor: "agent", action_type: "classify",
-          target_type: "event", target_id: eventId,
-          reasoning: `${severity}/${urgency} (${(confidence * 100).toFixed(0)}%) — ${reasoning}`,
+          user_id: userId, actor: "agent", action_type: "case_classify",
+          target_type: "case", target_id: caseId,
+          reasoning: `${caseClassification.severity}/${caseClassification.urgency}, importance=${caseClassification.importance_level}/10, escalation=${caseClassification.escalation_level}`,
         });
       } catch (e) {
-        // Default classification on failure
-        const importanceScore = computeImportance("medium", "normal");
+        // Default case classification on failure
         await db.from("classifications").insert({
-          event_id: eventId,
-          user_id: userId,
-          severity: "medium",
-          urgency: "normal",
-          importance_score: importanceScore,
-          reasoning: "Classification failed — default applied",
-          confidence: 0,
-          classified_by: "agent",
+          event_id: eventId, case_id: caseId, user_id: userId,
+          severity: "medium", urgency: "normal",
+          importance_score: 50, reasoning: "Classification failed — default applied",
+          confidence: 0, classified_by: "agent",
         });
         await db.from("events").update({ processing_status: "classified" }).eq("id", eventId);
+
         await logAudit(db, {
-          user_id: userId, actor: "agent", action_type: "classify_failed",
-          target_type: "event", target_id: eventId, reasoning: String(e),
+          user_id: userId, actor: "agent", action_type: "case_classify_failed",
+          target_type: "case", target_id: caseId, reasoning: String(e),
         });
       }
     }
 
-    // 5. Triage
+    // 5. CASE-LEVEL TRIAGE
+    // Check if case already has an open triage decision
     const { data: existingTriage } = await db.from("triage_decisions")
-      .select("id").eq("event_id", eventId).limit(1);
+      .select("id").eq("case_id", caseId).eq("status", "open").limit(1);
 
     if (!existingTriage || existingTriage.length === 0) {
-      // Get latest classification
-      const { data: cls } = await db.from("classifications")
-        .select("*").eq("event_id", eventId).order("created_at", { ascending: false }).limit(1).single();
+      // Get current case state
+      const { data: caseState } = await db.from("cases")
+        .select("importance_level, escalation_level, current_severity")
+        .eq("id", caseId).single();
 
-      const evSeverity = cls?.severity || "medium";
-      const evConfidence = cls?.confidence || 0;
-      const evImportance = cls?.importance_score || 50;
+      const importance = caseState?.importance_level || 5;
+      const escalation = caseState?.escalation_level || "none";
+      const severity = caseState?.current_severity || "medium";
 
-      // Critical always escalates
       let triageDecision: "autonomous_resolve" | "escalate" | "discard" = "escalate";
       let triageReasoning = "";
 
-      if (evSeverity === "critical") {
+      // Critical always escalates
+      if (severity === "critical" || escalation === "critical" || escalation === "high") {
         triageDecision = "escalate";
-        triageReasoning = "Critical severity — always escalates";
-      } else if (evSeverity === "info" && evConfidence > 0.9) {
+        triageReasoning = `Case escalation=${escalation}, severity=${severity} — requires human`;
+      } else if (severity === "info" && importance <= 2) {
         triageDecision = "discard";
-        triageReasoning = "Informational event with high confidence — discarded";
-      } else if (evImportance < 40 && evConfidence > 0.7) {
-        triageDecision = "autonomous_resolve";
-        triageReasoning = `Low importance (${evImportance}) with adequate confidence — autonomous resolution`;
-      } else {
-        triageDecision = "escalate";
-        triageReasoning = `Importance ${evImportance}, severity ${evSeverity} — requires human review`;
-      }
-
-      // If autonomous, check policy
-      if (triageDecision === "autonomous_resolve") {
+        triageReasoning = "Low importance informational case — discarded";
+      } else if (importance <= 3 && escalation === "none") {
+        // Try autonomous
         const { data: policy } = await db.from("policies")
           .select("*").eq("user_id", userId).eq("is_active", true)
           .order("version", { ascending: false }).limit(1).single();
 
         const rules: PolicyRule[] = policy?.rules || [];
         const policyResult = evaluatePolicy(rules, {
-          action_type: proposedAction,
-          severity: evSeverity,
+          action_type: "auto_resolve",
+          severity,
           gate_type: np.gate_type,
-          confidence: evConfidence,
+          confidence: 0.8,
         });
 
-        if (policyResult.decision === "require_human" || policyResult.decision === "reject") {
+        if (policyResult.decision === "approve") {
+          triageDecision = "autonomous_resolve";
+          triageReasoning = `Low importance (${importance}/10), policy approves`;
+        } else {
           triageDecision = "escalate";
-          triageReasoning += ` → Policy: ${policyResult.reasoning}`;
+          triageReasoning = `Low importance but policy requires human: ${policyResult.reasoning}`;
         }
+      } else {
+        triageDecision = "escalate";
+        triageReasoning = `Importance ${importance}/10, severity ${severity} — requires human review`;
       }
 
       const triageStatus = triageDecision === "escalate" ? "open" :
@@ -252,6 +290,7 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
 
       await db.from("triage_decisions").insert({
         event_id: eventId,
+        case_id: caseId,
         user_id: userId,
         decision: triageDecision,
         reasoning: triageReasoning,
@@ -260,25 +299,32 @@ export async function runPipeline(db: SupabaseClient, eventId: string, userId: s
         resolved_at: triageDecision !== "escalate" ? new Date().toISOString() : null,
       });
 
+      // If escalated, update case status
+      if (triageDecision === "escalate") {
+        await transitionCaseStatus(db, caseId, userId, "action_needed", "agent", triageReasoning);
+      }
+
       await logAudit(db, {
-        user_id: userId, actor: "agent", action_type: "triage",
-        target_type: "event", target_id: eventId,
+        user_id: userId, actor: "agent", action_type: "case_triage",
+        target_type: "case", target_id: caseId,
         reasoning: `${triageDecision}: ${triageReasoning}`,
       });
     }
+    // If there IS already an open triage — the case importance was already updated above via updateCaseClassification
 
-    // 6. Mark completed
+    // 6. Mark event completed
     await db.from("events").update({ processing_status: "completed" }).eq("id", eventId);
 
     await logAudit(db, {
       user_id: userId, actor: "agent", action_type: "pipeline_complete",
-      target_type: "event", target_id: eventId, reasoning: "Pipeline completed successfully",
+      target_type: "event", target_id: eventId, reasoning: `Case: ${caseId}`,
     });
   } catch (err) {
     console.error(`[pipeline] Error processing event ${eventId}:`, err);
+    const { data: evRetry } = await db.from("events").select("retry_count").eq("id", eventId).single();
     await db.from("events").update({
       processing_status: "needs_review",
-      retry_count: (await db.from("events").select("retry_count").eq("id", eventId).single()).data?.retry_count + 1 || 1,
+      retry_count: (evRetry?.retry_count || 0) + 1,
     }).eq("id", eventId);
     await logAudit(db, {
       user_id: userId, actor: "agent", action_type: "pipeline_error",

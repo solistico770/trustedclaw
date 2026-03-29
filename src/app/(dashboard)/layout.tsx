@@ -13,11 +13,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     // Fetch initial count
     async function fetchCount() {
       const { count } = await supabase
-        .from("triage_decisions")
+        .from("cases")
         .select("*", { count: "exact", head: true })
         .eq("user_id", DEMO_USER_ID)
-        .eq("decision", "escalate")
-        .eq("status", "open");
+        .in("status", ["open", "action_needed", "escalated"]);
       setEscalationCount(count || 0);
     }
     fetchCount();
@@ -28,7 +27,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       .on("postgres_changes", {
         event: "*",
         schema: "public",
-        table: "triage_decisions",
+        table: "cases",
       }, () => {
         fetchCount();
       })

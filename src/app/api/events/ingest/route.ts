@@ -29,13 +29,32 @@ export async function POST(req: NextRequest) {
       gateId = newGate?.id || null;
     }
 
+    // Find or create channel
+    let channelId: string | null = null;
+    const chName = channel_name || "Default";
+    if (gateId) {
+      const { data: existingChannel } = await db.from("channels")
+        .select("id").eq("gate_id", gateId).eq("display_name", chName).eq("user_id", user_id).limit(1).single();
+
+      if (existingChannel) {
+        channelId = existingChannel.id;
+        await db.from("channels").update({ last_activity_at: new Date().toISOString() }).eq("id", channelId);
+      } else {
+        const { data: newChannel } = await db.from("channels").insert({
+          gate_id: gateId, user_id, display_name: chName, external_channel_id: chName,
+        }).select("id").single();
+        channelId = newChannel?.id || null;
+      }
+    }
+
     // Save raw event synchronously
     const { data: event, error } = await db.from("events").insert({
       gate_id: gateId,
+      channel_id: channelId,
       user_id,
       occurred_at: simulated_timestamp || new Date().toISOString(),
       received_at: new Date().toISOString(),
-      raw_payload: { gate_type: gType, sender_name, channel_name, content, simulated_timestamp },
+      raw_payload: { gate_type: gType, sender_name, channel_name: chName, content, simulated_timestamp },
       processing_status: "pending",
     }).select("id").single();
 
@@ -45,20 +64,24 @@ export async function POST(req: NextRequest) {
 
     await logAudit(db, {
       user_id, actor: "system", action_type: "ingest",
-      target_type: "event", target_id: event.id, reasoning: `Ingested from ${gType}`,
+      target_type: "event", target_id: event.id, reasoning: `Ingested from ${gType}/${chName}`,
     });
 
-    // Run pipeline synchronously — Vercel serverless kills background tasks
+    // Run pipeline synchronously
     try {
       await runPipeline(db, event.id, user_id);
     } catch (e) {
       console.error("[ingest] pipeline error:", e);
     }
 
-    // Get final status
-    const { data: final } = await db.from("events").select("processing_status").eq("id", event.id).single();
+    // Get final status + case_id
+    const { data: final } = await db.from("events").select("processing_status, case_id").eq("id", event.id).single();
 
-    return NextResponse.json({ event_id: event.id, processing_status: final?.processing_status || "pending" });
+    return NextResponse.json({
+      event_id: event.id,
+      case_id: final?.case_id || null,
+      processing_status: final?.processing_status || "pending",
+    });
   } catch (e) {
     console.error("[ingest] error:", e);
     return NextResponse.json({ error: "Internal error" }, { status: 500 });
